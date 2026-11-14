@@ -29,6 +29,7 @@ import torch  # noqa: F401
 import triton
 import triton.language as tl
 
+import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
@@ -234,7 +235,16 @@ def _decode_num_stages(num_stages, num_ctas, max_seqlen_k, device):
     duplicate page-id loads are merged; from about 2 CTAs per SM on, the deeper
     prefetch costs occupancy and the fixed configuration is kept. Thresholds
     measured on H20 (decode, 1-128 requests).
+
+    A T-Head PPU keeps the configuration it is given. Over the 10 recorded
+    launches of the decode benchmark shapes (B 1-8, kv 1024/4096, GQA 32:8,
+    head_size 128; medians of two rounds against a +-3% repeat spread) no depth
+    beat the 3 stages of the fixed configuration: 5 stages measured 0.944-0.991x
+    and 2 stages 0.948-0.958x, while the load merge and the index prefetch were
+    both within the spread (1.000-1.005x), so this loop is not where they act.
     """
+    if flaggems_vllm.vendor_name == "thead":
+        return num_stages
     num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
     if num_ctas > 1.7 * num_sms:
         return num_stages

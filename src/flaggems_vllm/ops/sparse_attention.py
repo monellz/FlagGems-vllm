@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
@@ -128,7 +129,7 @@ def sparse_attn_triton_kernel(
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
-def _pipeline_launch_options(h_padded, num_ctas, topk, device):
+def _pipeline_launch_options(h_padded, num_ctas, topk, d, device):
     """Pipelining of the top-k KV loop with FlagTree (measured on H20).
 
     The loop reads the token ids, then the KV rows they select. With 16 or 32
@@ -140,10 +141,37 @@ def _pipeline_launch_options(h_padded, num_ctas, topk, device):
     sync_index = pipeline_options(pipeline_index_prefetch=False)
     if not sync_index:
         return {}
+    num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
+    if flaggems_vllm.vendor_name == "thead":
+        return _pipeline_launch_options_thead(
+            h_padded, num_ctas, topk, d, num_sms, sync_index
+        )
     if topk <= 256 or h_padded >= 64:
         return {"num_stages": 2}
-    num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
     if h_padded == 32 or num_ctas <= num_sms:
+        return sync_index
+    return {}
+
+
+def _pipeline_launch_options_thead(h_padded, num_ctas, topk, d, num_sms, sync_index):
+    """The same decision for a T-Head PPU, which wants a tighter CTA bound.
+
+    Reading the ids synchronously only pays while the loop is latency-bound,
+    and the bound is the ``load`` of flash_api.paged_kv_num_stages() -- the CTAs
+    per SM weighted by the KV tile size. The threshold 2.5 that holds for
+    flash_varlen_fwd_kernel (head_dim 256) holds here too (D=512), which is the
+    only independent check it has: at load 1.0 the synchronous ids are 1.27x and
+    at load 4.0 they are 0.78x. The 2-stage prefetch that NVIDIA takes for a
+    short loop or 64+ heads measured within the repeat spread here (0.98-1.01x
+    against +-8%), so those shapes keep the configuration they are given.
+
+    Measured on PPU-ZW810E over 6 shapes from the range of the NVIDIA comment
+    (D=512, top-k 128-2048, b 1-64), medians of two rounds.
+    """
+    if topk <= 256 or h_padded >= 64:
+        return {}
+    load = num_ctas * max(d, 64) / 128 / max(num_sms, 1)
+    if load <= 2.5:
         return sync_index
     return {}
 
@@ -162,7 +190,7 @@ def sparse_attn_triton(
     h_padded = max(16, triton.next_power_of_2(h))
 
     grid = (m, b)  # each program handles ALL h heads
-    launch_options = _pipeline_launch_options(h_padded, m * b, topk, q.device)
+    launch_options = _pipeline_launch_options(h_padded, m * b, topk, d, q.device)
     sparse_attn_triton_kernel[grid](
         q,
         kv,
