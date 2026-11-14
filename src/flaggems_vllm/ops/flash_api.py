@@ -60,6 +60,54 @@ def paged_kv_num_stages(num_stages, block_m, block_k, num_ctas, num_sms):
     return num_stages
 
 
+def _paged_kv_pipeline_thead(num_stages, block_m, block_k, num_ctas, num_sms):
+    """The same decision for a T-Head PPU, which wants different values.
+
+    ``load`` is the quantity of paged_kv_num_stages(). A latency-bound loop
+    (few resident CTAs) gains from reading the page ids synchronously and
+    giving the whole prefetch depth to the K/V rows; the depth itself stays at
+    3, because 4 measured 1% better and 5 exceeds shared memory (256 KB, and
+    the index reads are large with a page size of 256). A loop with enough CTAs
+    per SM prefers a 2-stage prefetch instead.
+
+    Measured on PPU-ZW810E over the 22 recorded launches of
+    flash_varlen_fwd_kernel (head_dim 256, page 256), each configuration the
+    median of two rounds against a +-0.8% repeat spread:
+
+      * 4 CTAs, kv_len 32768, BLOCK_M 16 (load 0.125): 1.36x with the index
+        prefetch off, and only 1.01x from the depth alone.
+      * 128-512 CTAs, BLOCK_M 16/32 (load 4-16): 1.08-1.17x at 2 stages.
+      * BLOCK_M 128 (load 4.5): 3 stages is already the best, so it is left
+        alone; that tile's gain comes from the load merge, which the PPU
+        heuristics entry keeps on (1.12x, see
+        runtime/backend/_thead/heuristics_config_utils.py).
+
+    The 2.5 threshold is inherited from the NVIDIA rule: the recorded shapes
+    leave 0.125 to 4 unsampled, so it is the boundary of the two measured
+    groups rather than a measured crossover.
+    """
+    load = num_ctas * max(block_k, 64) / 128 / max(num_sms, 1)
+    if block_m > 32:
+        return {"num_stages": num_stages}
+    if load <= 2.5:
+        return {
+            "num_stages": num_stages,
+            **pipeline_options(pipeline_index_prefetch=False),
+        }
+    return {"num_stages": 2}
+
+
+def paged_kv_pipeline_config(num_stages, block_m, block_k, num_ctas, num_sms):
+    """Pipelining of the paged K/V loop as launch keywords, per backend."""
+    if flaggems_vllm.vendor_name == "thead":
+        return _paged_kv_pipeline_thead(num_stages, block_m, block_k, num_ctas, num_sms)
+    return {
+        "num_stages": paged_kv_num_stages(
+            num_stages, block_m, block_k, num_ctas, num_sms
+        )
+    }
+
+
 def heuristic_pipeline_options(cfg, args):
     """FlagTree pipeline options carried by a heuristic config entry.
 
@@ -653,14 +701,16 @@ def mha_varlan_fwd(
                 "num_stages": 1 if not is_paged else cfg["num_stages"](args),
             }
             if is_paged and pipeline_options(pipeline_merge_loads="all"):
-                cfg_params["num_stages"] = paged_kv_num_stages(
-                    cfg_params["num_stages"],
-                    cfg_params["BLOCK_M"],
-                    cfg_params["BLOCK_K"],
-                    triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
-                    * batch_size
-                    * num_heads,
-                    num_sms,
+                cfg_params.update(
+                    paged_kv_pipeline_config(
+                        cfg_params["num_stages"],
+                        cfg_params["BLOCK_M"],
+                        cfg_params["BLOCK_K"],
+                        triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+                        * batch_size
+                        * num_heads,
+                        num_sms,
+                    )
                 )
             cfg_params.update(heuristic_pipeline_options(cfg, args))
 
@@ -1037,14 +1087,16 @@ def mha_varlan_fwd_opt(
             "num_stages": 1 if not is_paged else cfg["num_stages"](args),
         }
         if is_paged and pipeline_options(pipeline_merge_loads="all"):
-            cfg_params["num_stages"] = paged_kv_num_stages(
-                cfg_params["num_stages"],
-                cfg_params["BLOCK_M"],
-                cfg_params["BLOCK_K"],
-                triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
-                * batch_size
-                * num_heads,
-                num_sms,
+            cfg_params.update(
+                paged_kv_pipeline_config(
+                    cfg_params["num_stages"],
+                    cfg_params["BLOCK_M"],
+                    cfg_params["BLOCK_K"],
+                    triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"])
+                    * batch_size
+                    * num_heads,
+                    num_sms,
+                )
             )
 
         cfg_params.update(heuristic_pipeline_options(cfg, args))

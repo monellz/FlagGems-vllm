@@ -12,4 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-HEURISTICS_CONFIGS = {}
+HEURISTICS_CONFIGS = {
+    # An entry replaces the NVIDIA one as a whole (ConfigLoader falls back per
+    # op name, not per field), so the tile parameters are repeated unchanged.
+    "mha_block_128": {
+        "BLOCK_M": lambda args: 128,
+        "BLOCK_N": lambda args: 32,
+        "num_warps": lambda args: 4,
+        "num_stages": lambda args: 3,
+        # FlagTree: the NVIDIA entry switches the load merge off on this tile,
+        # where the two large matmuls dominate the K/V loop on H20. They do not
+        # dominate it on a PPU, whose dot is the synchronous
+        # ppu.mma.sync.aligned.m16n16k16 rather than a warpgroup wgmma, so the
+        # merge is worth 1.12x here (22 of 22 recorded launches of
+        # flash_varlen_fwd_kernel are slower without it, geomean 0.895x against
+        # a +-0.8% repeat spread; measured on PPU-ZW810E, page size 256).
+        "pipeline_merge_loads": lambda args: "all",
+    },
+}
