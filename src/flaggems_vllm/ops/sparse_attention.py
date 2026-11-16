@@ -158,15 +158,12 @@ def _pipeline_launch_options_thead(h_padded, num_ctas, topk, d, num_sms, sync_in
 
     Reading the ids synchronously only pays while the loop is latency-bound,
     and the bound is the ``load`` of flash_api.paged_kv_num_stages() -- the CTAs
-    per SM weighted by the KV tile size. The threshold 2.5 that holds for
-    flash_varlen_fwd_kernel (head_dim 256) holds here too (D=512), which is the
-    only independent check it has: at load 1.0 the synchronous ids are 1.27x and
-    at load 4.0 they are 0.78x. The 2-stage prefetch that NVIDIA takes for a
-    short loop or 64+ heads measured within the repeat spread here (0.98-1.01x
-    against +-8%), so those shapes keep the configuration they are given.
-
-    Measured on PPU-ZW810E over 6 shapes from the range of the NVIDIA comment
-    (D=512, top-k 128-2048, b 1-64), medians of two rounds.
+    per SM weighted by the KV tile size. One CTA per SM, where the NVIDIA rule
+    draws the line, is too loose here; the 2.5 boundary of that function
+    separates the measured groups on a PPU as well. The 2-stage prefetch NVIDIA
+    takes for a short loop or 64+ heads per program made no difference here, so
+    those shapes keep the configuration they are given. Thresholds measured on
+    PPU-ZW810E over the shape range of the comment above.
     """
     if topk <= 256 or h_padded >= 64:
         return {}

@@ -236,12 +236,10 @@ def _decode_num_stages(num_stages, num_ctas, max_seqlen_k, device):
     prefetch costs occupancy and the fixed configuration is kept. Thresholds
     measured on H20 (decode, 1-128 requests).
 
-    A T-Head PPU keeps the configuration it is given. Over the 10 recorded
-    launches of the decode benchmark shapes (B 1-8, kv 1024/4096, GQA 32:8,
-    head_size 128; medians of two rounds against a +-3% repeat spread) no depth
-    beat the 3 stages of the fixed configuration: 5 stages measured 0.944-0.991x
-    and 2 stages 0.948-0.958x, while the load merge and the index prefetch were
-    both within the spread (1.000-1.005x), so this loop is not where they act.
+    A T-Head PPU keeps the configuration it is given. Deepening this loop
+    costs more shared memory than the latency it hides there, so the fixed
+    configuration stays ahead; measured over the decode shapes of
+    benchmark/test_triton_unified_attention_perf.py.
     """
     if flaggems_vllm.vendor_name == "thead":
         return num_stages
